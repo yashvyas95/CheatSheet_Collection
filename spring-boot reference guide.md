@@ -3718,3 +3718,1839 @@ public class OrderService {
 | Write-Through | Write to cache & DB | Write-heavy |
 | Write-Behind | Async DB write | High write volume |
 | Refresh-Ahead | Proactive refresh | Predictable access |
+
+---
+
+## Reactive Spring Boot
+
+### 1. Reactive Programming Fundamentals
+
+**Reactive Streams API:**
+
+| Concept | Description | Example |
+|---------|-------------|---------|
+| Publisher | Emits data | Mono (0-1), Flux (0-N) |
+| Subscriber | Consumes data | subscribe() |
+| Subscription | Controls flow | request(), cancel() |
+| Processor | Both publisher & subscriber | Transform data |
+
+**Mono vs Flux:**
+
+| Type | Elements | Use Case | Example |
+|------|----------|----------|---------|
+| Mono | 0 or 1 | Single value, void | findById(), save() |
+| Flux | 0 to N | Stream of values | findAll(), events |
+
+---
+
+### 2. Spring WebFlux
+
+**WebFlux vs MVC:**
+
+| Aspect | Spring MVC | Spring WebFlux |
+|--------|-----------|----------------|
+| Threading | One thread per request | Non-blocking event loop |
+| Scalability | Limited by thread pool | High concurrent connections |
+| I/O Model | Blocking | Non-blocking (Netty, Undertow) |
+| Use Case | Traditional CRUD | Real-time, streaming |
+| Learning Curve | Easy | Steep |
+
+**Reactive Controller:**
+
+```java
+@RestController
+@RequestMapping("/api/products")
+public class ProductController {
+    
+    private final ProductService productService;
+    
+    // Return single item
+    @GetMapping("/{id}")
+    public Mono<ProductDTO> getProduct(@PathVariable String id) {
+        return productService.findById(id);
+    }
+    
+    // Return stream of items
+    @GetMapping
+    public Flux<ProductDTO> getAllProducts() {
+        return productService.findAll();
+    }
+    
+    // Server-Sent Events
+    @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ProductDTO> streamProducts() {
+        return productService.streamProducts()
+            .delayElements(Duration.ofSeconds(1));
+    }
+    
+    // Create with non-blocking
+    @PostMapping
+    public Mono<ResponseEntity<ProductDTO>> createProduct(
+        @RequestBody @Valid ProductRequest request
+    ) {
+        return productService.createProduct(request)
+            .map(product -> ResponseEntity
+                .created(URI.create("/api/products/" + product.getId()))
+                .body(product)
+            );
+    }
+    
+    // Handle errors reactively
+    @GetMapping("/{id}/details")
+    public Mono<ProductDetails> getProductDetails(@PathVariable String id) {
+        return productService.findById(id)
+            .switchIfEmpty(Mono.error(
+                new ResourceNotFoundException("Product not found")
+            ))
+            .flatMap(product -> productService.enrichWithDetails(product))
+            .onErrorResume(e -> {
+                log.error("Error fetching product details", e);
+                return Mono.just(ProductDetails.empty());
+            });
+    }
+}
+```
+
+**Reactive Service Layer:**
+
+```java
+@Service
+public class ProductService {
+    
+    private final ProductRepository productRepository;
+    private final WebClient inventoryClient;
+    
+    // Parallel calls
+    public Mono<ProductWithInventory> getProductWithInventory(String id) {
+        Mono<Product> productMono = productRepository.findById(id);
+        Mono<Inventory> inventoryMono = inventoryClient
+            .get()
+            .uri("/inventory/{id}", id)
+            .retrieve()
+            .bodyToMono(Inventory.class);
+        
+        return Mono.zip(productMono, inventoryMono)
+            .map(tuple -> new ProductWithInventory(
+                tuple.getT1(), 
+                tuple.getT2()
+            ));
+    }
+    
+    // Sequential composition
+    public Mono<Order> processOrder(OrderRequest request) {
+        return productRepository.findById(request.getProductId())
+            .flatMap(product -> validateStock(product))
+            .flatMap(product -> reserveInventory(product))
+            .flatMap(product -> createOrder(product))
+            .flatMap(order -> sendConfirmation(order));
+    }
+    
+    // Error handling with retry
+    public Mono<Product> getProductWithRetry(String id) {
+        return productRepository.findById(id)
+            .retryWhen(Retry.backoff(3, Duration.ofSeconds(1))
+                .filter(throwable -> throwable instanceof TimeoutException)
+            )
+            .timeout(Duration.ofSeconds(5))
+            .doOnError(e -> log.error("Failed to fetch product", e));
+    }
+    
+    // Backpressure handling
+    public Flux<Product> streamProductsWithBackpressure() {
+        return productRepository.findAll()
+            .onBackpressureBuffer(100)
+            .delayElements(Duration.ofMillis(100));
+    }
+}
+```
+
+---
+
+### 3. R2DBC (Reactive Relational Database)
+
+**Configuration:**
+
+```yaml
+spring:
+  r2dbc:
+    url: r2dbc:postgresql://localhost:5432/productdb
+    username: admin
+    password: secret
+    pool:
+      initial-size: 10
+      max-size: 20
+      max-idle-time: 30m
+```
+
+**Reactive Repository:**
+
+```java
+@Repository
+public interface ProductRepository extends ReactiveCrudRepository<Product, String> {
+    
+    Flux<Product> findByCategory(String category);
+    
+    @Query("SELECT * FROM products WHERE price > :minPrice")
+    Flux<Product> findExpensiveProducts(@Param("minPrice") BigDecimal minPrice);
+    
+    Mono<Product> findByName(String name);
+    
+    @Modifying
+    @Query("UPDATE products SET stock = stock - :quantity WHERE id = :id")
+    Mono<Integer> decrementStock(@Param("id") String id, 
+                                  @Param("quantity") int quantity);
+}
+```
+
+**Custom Reactive Repository:**
+
+```java
+@Component
+public class CustomProductRepository {
+    
+    private final DatabaseClient databaseClient;
+    
+    public Flux<Product> findByComplexCriteria(SearchCriteria criteria) {
+        return databaseClient
+            .sql("SELECT * FROM products WHERE category = :category " +
+                 "AND price BETWEEN :minPrice AND :maxPrice")
+            .bind("category", criteria.getCategory())
+            .bind("minPrice", criteria.getMinPrice())
+            .bind("maxPrice", criteria.getMaxPrice())
+            .map((row, metadata) -> Product.builder()
+                .id(row.get("id", String.class))
+                .name(row.get("name", String.class))
+                .price(row.get("price", BigDecimal.class))
+                .build()
+            )
+            .all();
+    }
+}
+```
+
+---
+
+### 4. Reactive WebClient
+
+**WebClient Configuration:**
+
+```java
+@Configuration
+public class WebClientConfig {
+    
+    @Bean
+    public WebClient inventoryWebClient() {
+        return WebClient.builder()
+            .baseUrl("http://inventory-service")
+            .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+            .clientConnector(new ReactorClientHttpConnector(
+                HttpClient.create()
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+                    .responseTimeout(Duration.ofSeconds(5))
+                    .doOnConnected(conn -> conn
+                        .addHandlerLast(new ReadTimeoutHandler(5))
+                        .addHandlerLast(new WriteTimeoutHandler(5))
+                    )
+            ))
+            .filter(ExchangeFilterFunction.ofRequestProcessor(
+                clientRequest -> {
+                    log.info("Request: {} {}", 
+                        clientRequest.method(), 
+                        clientRequest.url()
+                    );
+                    return Mono.just(clientRequest);
+                }
+            ))
+            .build();
+    }
+}
+```
+
+**WebClient Usage:**
+
+```java
+@Service
+public class InventoryClient {
+    
+    private final WebClient webClient;
+    
+    // GET request
+    public Mono<Inventory> getInventory(String productId) {
+        return webClient
+            .get()
+            .uri("/inventory/{id}", productId)
+            .retrieve()
+            .onStatus(HttpStatus::is4xxClientError, response ->
+                Mono.error(new ResourceNotFoundException("Inventory not found"))
+            )
+            .onStatus(HttpStatus::is5xxServerError, response ->
+                Mono.error(new ServiceException("Inventory service error"))
+            )
+            .bodyToMono(Inventory.class)
+            .timeout(Duration.ofSeconds(3))
+            .retryWhen(Retry.backoff(2, Duration.ofSeconds(1)));
+    }
+    
+    // POST request
+    public Mono<ReservationResponse> reserveInventory(ReservationRequest request) {
+        return webClient
+            .post()
+            .uri("/inventory/reserve")
+            .bodyValue(request)
+            .retrieve()
+            .bodyToMono(ReservationResponse.class);
+    }
+    
+    // Parallel requests
+    public Mono<ProductDetails> getProductDetails(String productId) {
+        Mono<Product> productMono = getProduct(productId);
+        Mono<Inventory> inventoryMono = getInventory(productId);
+        Mono<Reviews> reviewsMono = getReviews(productId);
+        
+        return Mono.zip(productMono, inventoryMono, reviewsMono)
+            .map(tuple -> ProductDetails.builder()
+                .product(tuple.getT1())
+                .inventory(tuple.getT2())
+                .reviews(tuple.getT3())
+                .build()
+            );
+    }
+}
+```
+
+---
+
+### 5. Reactive Security
+
+**Security Configuration:**
+
+```java
+@Configuration
+@EnableWebFluxSecurity
+public class ReactiveSecurityConfig {
+    
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        return http
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)
+            .authorizeExchange(exchanges -> exchanges
+                .pathMatchers("/api/public/**").permitAll()
+                .pathMatchers("/api/admin/**").hasRole("ADMIN")
+                .anyExchange().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.jwtDecoder(jwtDecoder()))
+            )
+            .build();
+    }
+    
+    @Bean
+    public ReactiveJwtDecoder jwtDecoder() {
+        return ReactiveJwtDecoders.fromIssuerLocation(
+            "https://auth.example.com/oauth2/default"
+        );
+    }
+}
+```
+
+**Reactive JWT Authentication:**
+
+```java
+@Component
+public class JwtAuthenticationManager implements ReactiveAuthenticationManager {
+    
+    private final JwtService jwtService;
+    
+    @Override
+    public Mono<Authentication> authenticate(Authentication authentication) {
+        return Mono.justOrEmpty(authentication)
+            .filter(auth -> auth.getCredentials() != null)
+            .flatMap(auth -> {
+                String token = auth.getCredentials().toString();
+                return jwtService.validateToken(token)
+                    .map(valid -> {
+                        if (valid) {
+                            return new UsernamePasswordAuthenticationToken(
+                                jwtService.extractUsername(token),
+                                token,
+                                jwtService.extractAuthorities(token)
+                            );
+                        }
+                        throw new BadCredentialsException("Invalid token");
+                    });
+            });
+    }
+}
+```
+
+---
+
+## GraphQL with Spring Boot
+
+### 1. GraphQL Setup
+
+**Dependencies (Maven):**
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-graphql</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+```
+
+**Dependencies (Gradle):**
+
+```gradle
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-graphql'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+}
+```
+
+**Schema Definition:**
+
+```graphql
+# schema.graphqls
+type Query {
+    productById(id: ID!): Product
+    products(filter: ProductFilter, page: Int, size: Int): ProductPage
+    searchProducts(query: String!): [Product]
+}
+
+type Mutation {
+    createProduct(input: CreateProductInput!): Product
+    updateProduct(id: ID!, input: UpdateProductInput!): Product
+    deleteProduct(id: ID!): Boolean
+}
+
+type Subscription {
+    productPriceUpdated(productId: ID!): Product
+}
+
+type Product {
+    id: ID!
+    name: String!
+    description: String
+    price: Float!
+    category: Category!
+    inventory: Inventory
+    reviews: [Review]
+}
+
+type Category {
+    id: ID!
+    name: String!
+    products: [Product]
+}
+
+input CreateProductInput {
+    name: String!
+    description: String
+    price: Float!
+    categoryId: ID!
+}
+
+input ProductFilter {
+    categoryId: ID
+    minPrice: Float
+    maxPrice: Float
+}
+
+type ProductPage {
+    content: [Product]
+    totalElements: Int
+    totalPages: Int
+    pageNumber: Int
+}
+```
+
+---
+
+### 2. GraphQL Controllers
+
+**Query Controller:**
+
+```java
+@Controller
+public class ProductGraphQLController {
+    
+    private final ProductService productService;
+    
+    @QueryMapping
+    public Product productById(@Argument String id) {
+        return productService.findById(id)
+            .orElseThrow(() -> new GraphQLException("Product not found"));
+    }
+    
+    @QueryMapping
+    public Page<Product> products(
+        @Argument ProductFilter filter,
+        @Argument Integer page,
+        @Argument Integer size
+    ) {
+        Pageable pageable = PageRequest.of(
+            page != null ? page : 0, 
+            size != null ? size : 20
+        );
+        return productService.findProducts(filter, pageable);
+    }
+    
+    @QueryMapping
+    public List<Product> searchProducts(@Argument String query) {
+        return productService.searchProducts(query);
+    }
+}
+```
+
+**Mutation Controller:**
+
+```java
+@Controller
+public class ProductMutationController {
+    
+    private final ProductService productService;
+    
+    @MutationMapping
+    public Product createProduct(@Argument CreateProductInput input) {
+        return productService.createProduct(input);
+    }
+    
+    @MutationMapping
+    public Product updateProduct(
+        @Argument String id, 
+        @Argument UpdateProductInput input
+    ) {
+        return productService.updateProduct(id, input);
+    }
+    
+    @MutationMapping
+    public Boolean deleteProduct(@Argument String id) {
+        productService.deleteProduct(id);
+        return true;
+    }
+}
+```
+
+**Data Fetchers (N+1 Prevention):**
+
+```java
+@Controller
+public class ProductDataFetcher {
+    
+    private final CategoryService categoryService;
+    private final InventoryService inventoryService;
+    
+    // Batch loading to prevent N+1
+    @BatchMapping
+    public Map<Product, Category> category(List<Product> products) {
+        Set<String> categoryIds = products.stream()
+            .map(Product::getCategoryId)
+            .collect(Collectors.toSet());
+        
+        List<Category> categories = categoryService.findByIds(categoryIds);
+        
+        Map<String, Category> categoryMap = categories.stream()
+            .collect(Collectors.toMap(Category::getId, Function.identity()));
+        
+        return products.stream()
+            .collect(Collectors.toMap(
+                Function.identity(),
+                product -> categoryMap.get(product.getCategoryId())
+            ));
+    }
+    
+    @SchemaMapping
+    public Inventory inventory(Product product) {
+        return inventoryService.getInventory(product.getId());
+    }
+}
+```
+
+---
+
+### 3. GraphQL Subscriptions
+
+```java
+@Controller
+public class ProductSubscriptionController {
+    
+    private final Sinks.Many<Product> productSink;
+    
+    public ProductSubscriptionController() {
+        this.productSink = Sinks.many().multicast().onBackpressureBuffer();
+    }
+    
+    @SubscriptionMapping
+    public Flux<Product> productPriceUpdated(@Argument String productId) {
+        return productSink.asFlux()
+            .filter(product -> product.getId().equals(productId));
+    }
+    
+    // Called when product price updates
+    public void publishPriceUpdate(Product product) {
+        productSink.tryEmitNext(product);
+    }
+}
+```
+
+---
+
+### 4. GraphQL Error Handling
+
+```java
+@ControllerAdvice
+public class GraphQLExceptionHandler {
+    
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public GraphQLError handleResourceNotFound(ResourceNotFoundException ex) {
+        return GraphQLError.newError()
+            .errorType(ErrorType.NOT_FOUND)
+            .message(ex.getMessage())
+            .build();
+    }
+    
+    @ExceptionHandler(ValidationException.class)
+    public GraphQLError handleValidation(ValidationException ex) {
+        return GraphQLError.newError()
+            .errorType(ErrorType.ValidationError)
+            .message(ex.getMessage())
+            .extensions(Map.of("errors", ex.getErrors()))
+            .build();
+    }
+}
+```
+
+**GraphQL vs REST:**
+
+| Aspect | REST | GraphQL |
+|--------|------|---------|
+| Data Fetching | Multiple endpoints | Single endpoint |
+| Over-fetching | Common | None (client specifies) |
+| Under-fetching | Common (N requests) | None (nested queries) |
+| Versioning | URL versioning | Schema evolution |
+| Caching | HTTP caching | More complex |
+| Learning Curve | Lower | Higher |
+| Use Case | CRUD, public APIs | Complex queries, mobile apps |
+
+---
+
+## Cloud-Native Deployments
+
+### 1. AWS Deployments
+
+**ECS/Fargate Configuration:**
+
+```yaml
+# task-definition.json
+{
+  "family": "order-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [{
+    "name": "order-service",
+    "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/order-service:latest",
+    "portMappings": [{
+      "containerPort": 8080,
+      "protocol": "tcp"
+    }],
+    "environment": [
+      {"name": "SPRING_PROFILES_ACTIVE", "value": "prod"},
+      {"name": "SPRING_DATASOURCE_URL", "value": "jdbc:postgresql://prod-db:5432/orders"}
+    ],
+    "secrets": [
+      {
+        "name": "SPRING_DATASOURCE_PASSWORD",
+        "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789:secret:db-password"
+      }
+    ],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/order-service",
+        "awslogs-region": "us-east-1",
+        "awslogs-stream-prefix": "ecs"
+      }
+    },
+    "healthCheck": {
+      "command": ["CMD-SHELL", "wget --spider http://localhost:8080/actuator/health || exit 1"],
+      "interval": 30,
+      "timeout": 5,
+      "retries": 3
+    }
+  }]
+}
+```
+
+**Spring Cloud AWS Integration:**
+
+```java
+@Configuration
+public class AwsConfig {
+    
+    @Bean
+    public S3Client s3Client() {
+        return S3Client.builder()
+            .region(Region.US_EAST_1)
+            .build();
+    }
+    
+    @Bean
+    public SqsTemplate sqsTemplate() {
+        return SqsTemplate.builder()
+            .sqsAsyncClient(SqsAsyncClient.builder()
+                .region(Region.US_EAST_1)
+                .build())
+            .build();
+    }
+}
+
+@Service
+public class AwsStorageService {
+    
+    private final S3Client s3Client;
+    
+    public void uploadFile(String bucket, String key, InputStream data) {
+        PutObjectRequest request = PutObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .build();
+        
+        s3Client.putObject(request, RequestBody.fromInputStream(data, data.available()));
+    }
+    
+    public InputStream downloadFile(String bucket, String key) {
+        GetObjectRequest request = GetObjectRequest.builder()
+            .bucket(bucket)
+            .key(key)
+            .build();
+        
+        return s3Client.getObject(request);
+    }
+}
+```
+
+---
+
+### 2. GCP Deployments
+
+**GKE Configuration:**
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: gcr.io/project-id/order-service:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "gcp"
+        - name: SPRING_CLOUD_GCP_PROJECT_ID
+          value: "your-project-id"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+```
+
+**Spring Cloud GCP:**
+
+```java
+@Configuration
+public class GcpConfig {
+    
+    @Bean
+    public Storage storage() throws IOException {
+        return StorageOptions.getDefaultInstance().getService();
+    }
+}
+
+@Service
+public class GcpStorageService {
+    
+    private final Storage storage;
+    
+    public void uploadFile(String bucketName, String objectName, byte[] data) {
+        BlobId blobId = BlobId.of(bucketName, objectName);
+        BlobInfo blobInfo = BlobInfo.newBuilder(blobId).build();
+        storage.create(blobInfo, data);
+    }
+    
+    public byte[] downloadFile(String bucketName, String objectName) {
+        Blob blob = storage.get(BlobId.of(bucketName, objectName));
+        return blob.getContent();
+    }
+}
+```
+
+---
+
+### 3. Azure Deployments
+
+**Azure Spring Apps Configuration:**
+
+```yaml
+# application-azure.yml
+spring:
+  cloud:
+    azure:
+      storage:
+        account: yourstorageaccount
+      keyvault:
+        secret:
+          endpoint: https://yourkeyvault.vault.azure.net/
+      servicebus:
+        namespace: yourservicebus
+```
+
+**Azure Integration:**
+
+```java
+@Configuration
+public class AzureConfig {
+    
+    @Bean
+    public BlobServiceClient blobServiceClient(
+        @Value("${spring.cloud.azure.storage.account}") String accountName
+    ) {
+        return new BlobServiceClientBuilder()
+            .endpoint(String.format("https://%s.blob.core.windows.net", accountName))
+            .buildClient();
+    }
+}
+```
+
+---
+
+## OpenAPI/Swagger Documentation
+
+### 1. Springdoc OpenAPI Setup
+
+**Dependencies (Maven):**
+
+```xml
+<dependency>
+    <groupId>org.springdoc</groupId>
+    <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+    <version>2.2.0</version>
+</dependency>
+```
+
+**Dependencies (Gradle):**
+
+```gradle
+dependencies {
+    implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:2.2.0'
+}
+```
+
+**Configuration:**
+
+```java
+@Configuration
+public class OpenAPIConfig {
+    
+    @Bean
+    public OpenAPI customOpenAPI() {
+        return new OpenAPI()
+            .info(new Info()
+                .title("Order Service API")
+                .version("1.0")
+                .description("API for managing orders")
+                .contact(new Contact()
+                    .name("API Support")
+                    .email("api@example.com")
+                )
+                .license(new License()
+                    .name("Apache 2.0")
+                    .url("https://www.apache.org/licenses/LICENSE-2.0.html")
+                )
+            )
+            .servers(List.of(
+                new Server().url("https://api.example.com").description("Production"),
+                new Server().url("https://staging-api.example.com").description("Staging"),
+                new Server().url("http://localhost:8080").description("Development")
+            ))
+            .components(new Components()
+                .addSecuritySchemes("bearer-jwt", new SecurityScheme()
+                    .type(SecurityScheme.Type.HTTP)
+                    .scheme("bearer")
+                    .bearerFormat("JWT")
+                )
+            )
+            .addSecurityItem(new SecurityRequirement().addList("bearer-jwt"));
+    }
+    
+    @Bean
+    public GroupedOpenApi publicApi() {
+        return GroupedOpenApi.builder()
+            .group("public")
+            .pathsToMatch("/api/public/**")
+            .build();
+    }
+    
+    @Bean
+    public GroupedOpenApi adminApi() {
+        return GroupedOpenApi.builder()
+            .group("admin")
+            .pathsToMatch("/api/admin/**")
+            .build();
+    }
+}
+```
+
+**Enhanced Controller Documentation:**
+
+```java
+@RestController
+@RequestMapping("/api/orders")
+@Tag(name = "Orders", description = "Order management APIs")
+public class OrderController {
+    
+    @Operation(
+        summary = "Get order by ID",
+        description = "Retrieves a specific order by its unique identifier",
+        responses = {
+            @ApiResponse(
+                responseCode = "200",
+                description = "Order found",
+                content = @Content(
+                    mediaType = "application/json",
+                    schema = @Schema(implementation = OrderDTO.class)
+                )
+            ),
+            @ApiResponse(
+                responseCode = "404",
+                description = "Order not found",
+                content = @Content(
+                    mediaType = "application/json",
+                    schema = @Schema(implementation = ErrorResponse.class)
+                )
+            ),
+            @ApiResponse(
+                responseCode = "401",
+                description = "Unauthorized"
+            )
+        }
+    )
+    @GetMapping("/{id}")
+    public ResponseEntity<OrderDTO> getOrder(
+        @Parameter(description = "Order ID", required = true, example = "12345")
+        @PathVariable Long id
+    ) {
+        return orderService.findById(id)
+            .map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+    
+    @Operation(summary = "Create new order")
+    @PostMapping
+    public ResponseEntity<OrderDTO> createOrder(
+        @io.swagger.v3.oas.annotations.parameters.RequestBody(
+            description = "Order creation request",
+            required = true,
+            content = @Content(
+                schema = @Schema(implementation = CreateOrderRequest.class)
+            )
+        )
+        @Valid @RequestBody CreateOrderRequest request
+    ) {
+        OrderDTO created = orderService.createOrder(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
+    }
+}
+```
+
+**Model Documentation:**
+
+```java
+@Schema(description = "Order creation request")
+public class CreateOrderRequest {
+    
+    @Schema(description = "Customer ID", example = "1001", required = true)
+    @NotNull
+    private Long customerId;
+    
+    @Schema(description = "Order items", required = true)
+    @NotEmpty
+    private List<OrderItemRequest> items;
+    
+    @Schema(description = "Shipping address", required = true)
+    @Valid
+    private AddressDTO shippingAddress;
+    
+    @Schema(description = "Payment method", example = "CREDIT_CARD", allowableValues = {"CREDIT_CARD", "PAYPAL", "BANK_TRANSFER"})
+    private PaymentMethod paymentMethod;
+}
+```
+
+**Configuration Properties:**
+
+```yaml
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+    enabled: true
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+    operations-sorter: method
+    tags-sorter: alpha
+    try-it-out-enabled: true
+  show-actuator: true
+  default-consumes-media-type: application/json
+  default-produces-media-type: application/json
+```
+
+---
+
+## Spring Cloud Config
+
+### 1. Config Server Setup
+
+**Config Server Application:**
+
+```java
+@SpringBootApplication
+@EnableConfigServer
+public class ConfigServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ConfigServerApplication.class, args);
+    }
+}
+```
+
+**Config Server Properties:**
+
+```yaml
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/yourorg/config-repo
+          default-label: main
+          search-paths: '{application}'
+          clone-on-start: true
+        # Or use native filesystem
+        # native:
+        #   search-locations: file:///path/to/config
+  security:
+    user:
+      name: config-user
+      password: ${CONFIG_PASSWORD}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,refresh
+```
+
+---
+
+### 2. Config Client Setup
+
+**Dependencies (Maven):**
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-config</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-bus-amqp</artifactId>
+</dependency>
+```
+
+**Dependencies (Gradle):**
+
+```gradle
+dependencies {
+    implementation 'org.springframework.cloud:spring-cloud-starter-config'
+    implementation 'org.springframework.cloud:spring-cloud-starter-bus-amqp'
+}
+```
+
+**Bootstrap Configuration:**
+
+```yaml
+spring:
+  application:
+    name: order-service
+  cloud:
+    config:
+      uri: http://localhost:8888
+      username: config-user
+      password: ${CONFIG_PASSWORD}
+      fail-fast: true
+      retry:
+        initial-interval: 1000
+        max-attempts: 6
+        multiplier: 1.1
+```
+
+**Refresh Configuration:**
+
+```java
+@RestController
+@RefreshScope  // Allows dynamic refresh
+public class OrderController {
+    
+    @Value("${order.max-items:10}")
+    private int maxItems;
+    
+    @Value("${order.processing.timeout:30000}")
+    private long timeout;
+    
+    // These values will refresh when /actuator/refresh is called
+}
+```
+
+**Dynamic Refresh with Config Bus:**
+
+```yaml
+spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+  cloud:
+    bus:
+      enabled: true
+      refresh:
+        enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: busrefresh,health,info
+```
+
+**Trigger Refresh Across All Instances:**
+
+```bash
+# Refresh all instances
+curl -X POST http://localhost:8080/actuator/busrefresh
+
+# Refresh specific service
+curl -X POST http://localhost:8080/actuator/busrefresh?destination=order-service:**
+```
+
+---
+
+## Contract Testing with Pact
+
+### 1. Consumer-Driven Contracts
+
+**Pact Dependencies (Maven):**
+
+```xml
+<dependency>
+    <groupId>au.com.dius.pact.consumer</groupId>
+    <artifactId>junit5</artifactId>
+    <version>4.6.0</version>
+    <scope>test</scope>
+</dependency>
+```
+
+**Pact Dependencies (Gradle):**
+
+```gradle
+testImplementation 'au.com.dius.pact.consumer:junit5:4.6.0'
+```
+
+**Consumer Test (Order Service testing Payment Service):**
+
+```java
+@ExtendWith(PactConsumerTestExt.class)
+@PactTestFor(providerName = "payment-service")
+public class PaymentServiceContractTest {
+    
+    @Pact(consumer = "order-service")
+    public RequestResponsePact createPaymentPact(PactDslWithProvider builder) {
+        return builder
+            .given("payment account exists")
+            .uponReceiving("a request to process payment")
+            .path("/api/payments")
+            .method("POST")
+            .body(new PactDslJsonBody()
+                .stringType("orderId", "12345")
+                .decimalType("amount", 100.00)
+                .stringType("customerId", "CUST001")
+            )
+            .willRespondWith()
+            .status(200)
+            .body(new PactDslJsonBody()
+                .stringType("paymentId", "PAY-123")
+                .stringValue("status", "SUCCESS")
+                .stringType("transactionId", "TXN-456")
+            )
+            .toPact();
+    }
+    
+    @Test
+    @PactTestFor(pactMethod = "createPaymentPact")
+    void testProcessPayment(MockServer mockServer) {
+        // Configure client to use mock server
+        PaymentClient client = new PaymentClient(mockServer.getUrl());
+        
+        // Execute request
+        PaymentRequest request = PaymentRequest.builder()
+            .orderId("12345")
+            .amount(new BigDecimal("100.00"))
+            .customerId("CUST001")
+            .build();
+        
+        PaymentResponse response = client.processPayment(request);
+        
+        // Verify contract
+        assertThat(response.getPaymentId()).isNotNull();
+        assertThat(response.getStatus()).isEqualTo("SUCCESS");
+        assertThat(response.getTransactionId()).isNotNull();
+    }
+}
+```
+
+**Provider Verification (Payment Service):**
+
+```java
+@Provider("payment-service")
+@PactBroker(host = "localhost", port = "9292")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+public class PaymentServiceProviderTest {
+    
+    @LocalServerPort
+    private int port;
+    
+    @Autowired
+    private PaymentRepository paymentRepository;
+    
+    @BeforeEach
+    void setup(PactVerificationContext context) {
+        context.setTarget(new HttpTestTarget("localhost", port));
+    }
+    
+    @TestTemplate
+    @ExtendWith(PactVerificationInvocationContextProvider.class)
+    void pactVerificationTestTemplate(PactVerificationContext context) {
+        context.verifyInteraction();
+    }
+    
+    @State("payment account exists")
+    public void paymentAccountExists() {
+        // Setup test data
+        paymentRepository.save(PaymentAccount.builder()
+            .customerId("CUST001")
+            .balance(new BigDecimal("1000.00"))
+            .status("ACTIVE")
+            .build());
+    }
+}
+```
+
+**Pact Workflow:**
+
+| Step | Action | Tool |
+|------|--------|------|
+| 1. Consumer writes test | Define expected interactions | Pact DSL |
+| 2. Generate contract | Run consumer tests | Pact file generated |
+| 3. Publish contract | Upload to broker | Pact Broker |
+| 4. Provider verifies | Run against actual API | Provider tests |
+| 5. CI/CD check | Verify before deploy | can-i-deploy |
+
+---
+
+## AI/ML Integration
+
+### 1. Spring AI Setup
+
+**Dependencies (Maven):**
+
+```xml
+<dependency>
+    <groupId>org.springframework.experimental.ai</groupId>
+    <artifactId>spring-ai-openai-spring-boot-starter</artifactId>
+    <version>0.8.0</version>
+</dependency>
+```
+
+**Dependencies (Gradle):**
+
+```gradle
+dependencies {
+    implementation 'org.springframework.experimental.ai:spring-ai-openai-spring-boot-starter:0.8.0'
+}
+```
+
+**Configuration:**
+
+```yaml
+spring:
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      model: gpt-4
+      temperature: 0.7
+```
+
+**AI Service Implementation:**
+
+```java
+@Service
+public class ProductRecommendationService {
+    
+    private final ChatClient chatClient;
+    private final EmbeddingClient embeddingClient;
+    
+    public ProductRecommendationService(
+        ChatClient chatClient,
+        EmbeddingClient embeddingClient
+    ) {
+        this.chatClient = chatClient;
+        this.embeddingClient = embeddingClient;
+    }
+    
+    public String generateProductDescription(Product product) {
+        String prompt = String.format(
+            "Generate a compelling product description for: %s. " +
+            "Category: %s. Features: %s",
+            product.getName(),
+            product.getCategory(),
+            product.getFeatures()
+        );
+        
+        ChatResponse response = chatClient.call(
+            new Prompt(prompt)
+        );
+        
+        return response.getResult().getOutput().getContent();
+    }
+    
+    public List<Product> findSimilarProducts(String query) {
+        // Generate embedding for query
+        List<Double> queryEmbedding = embeddingClient
+            .embed(query)
+            .getResult()
+            .getOutput();
+        
+        // Find similar products using vector similarity
+        return productRepository.findSimilarByEmbedding(
+            queryEmbedding,
+            0.8, // similarity threshold
+            10   // top K results
+        );
+    }
+    
+    public ChatResponse chatWithContext(String userMessage, String context) {
+        String systemMessage = "You are a helpful product assistant. " +
+            "Use the following context to answer questions: " + context;
+        
+        return chatClient.call(new Prompt(
+            List.of(
+                new SystemMessage(systemMessage),
+                new UserMessage(userMessage)
+            )
+        ));
+    }
+}
+```
+
+---
+
+### 2. ML Model Serving
+
+**TensorFlow Serving Integration:**
+
+```java
+@Service
+public class PredictionService {
+    
+    private final RestTemplate restTemplate;
+    
+    @Value("${tensorflow.serving.url}")
+    private String tfServingUrl;
+    
+    public PredictionResult predict(PredictionRequest request) {
+        String url = tfServingUrl + "/v1/models/product_model:predict";
+        
+        // Prepare input
+        Map<String, Object> input = Map.of(
+            "signature_name", "serving_default",
+            "instances", List.of(request.getFeatures())
+        );
+        
+        // Call TensorFlow Serving
+        ResponseEntity<PredictionResponse> response = restTemplate.postForEntity(
+            url,
+            input,
+            PredictionResponse.class
+        );
+        
+        return parsePrediction(response.getBody());
+    }
+}
+```
+
+**Custom ML Model Endpoint:**
+
+```java
+@RestController
+@RequestMapping("/api/ml")
+public class MLController {
+    
+    private final ModelService modelService;
+    
+    @PostMapping("/predict")
+    public ResponseEntity<PredictionResult> predict(
+        @RequestBody PredictionRequest request
+    ) {
+        PredictionResult result = modelService.predict(request);
+        return ResponseEntity.ok(result);
+    }
+    
+    @GetMapping("/model/info")
+    public ResponseEntity<ModelInfo> getModelInfo() {
+        return ResponseEntity.ok(ModelInfo.builder()
+            .name("product-recommendation")
+            .version("1.0.0")
+            .framework("TensorFlow")
+            .lastTrained(LocalDateTime.now())
+            .accuracy(0.92)
+            .build()
+        );
+    }
+    
+    @PostMapping("/feedback")
+    public ResponseEntity<Void> submitFeedback(
+        @RequestBody PredictionFeedback feedback
+    ) {
+        // Store feedback for model retraining
+        modelService.storeFeedback(feedback);
+        return ResponseEntity.accepted().build();
+    }
+}
+```
+
+**Feature Store Pattern:**
+
+```java
+@Service
+public class FeatureStoreService {
+    
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final FeatureRepository featureRepository;
+    
+    public Features getFeatures(String entityId, List<String> featureNames) {
+        // Try cache first
+        String cacheKey = "features:" + entityId;
+        Features cached = (Features) redisTemplate.opsForValue().get(cacheKey);
+        
+        if (cached != null && cached.hasAll(featureNames)) {
+            return cached;
+        }
+        
+        // Fetch from database
+        Features features = featureRepository.findByEntityId(entityId);
+        
+        // Cache for 1 hour
+        redisTemplate.opsForValue().set(
+            cacheKey, 
+            features, 
+            Duration.ofHours(1)
+        );
+        
+        return features;
+    }
+    
+    public void updateFeatures(String entityId, Map<String, Object> features) {
+        featureRepository.update(entityId, features);
+        
+        // Invalidate cache
+        redisTemplate.delete("features:" + entityId);
+    }
+}
+```
+
+---
+
+## Gradle Build Configuration
+
+### 1. Basic Gradle Setup
+
+**build.gradle (Groovy DSL):**
+
+```gradle
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0'
+    id 'io.spring.dependency-management' version '1.1.4'
+}
+
+group = 'com.example'
+version = '1.0.0'
+sourceCompatibility = '17'
+
+configurations {
+    compileOnly {
+        extendsFrom annotationProcessor
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Spring Boot Starters
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-security'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    
+    // Database
+    runtimeOnly 'org.postgresql:postgresql'
+    implementation 'com.zaxxer:HikariCP'
+    
+    // Lombok
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+    
+    // MapStruct
+    implementation 'org.mapstruct:mapstruct:1.5.5.Final'
+    annotationProcessor 'org.mapstruct:mapstruct-processor:1.5.5.Final'
+    
+    // Testing
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.security:spring-security-test'
+    testImplementation 'org.testcontainers:postgresql:1.19.3'
+    testImplementation 'org.testcontainers:junit-jupiter:1.19.3'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// Custom tasks
+task createDockerfile {
+    doLast {
+        def dockerfileContent = """
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY build/libs/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+"""
+        new File("Dockerfile").text = dockerfileContent
+    }
+}
+```
+
+**build.gradle.kts (Kotlin DSL):**
+
+```kotlin
+plugins {
+    java
+    id("org.springframework.boot") version "3.2.0"
+    id("io.spring.dependency-management") version "1.1.4"
+}
+
+group = "com.example"
+version = "1.0.0"
+java.sourceCompatibility = JavaVersion.VERSION_17
+
+configurations {
+    compileOnly {
+        extendsFrom(configurations.annotationProcessor.get())
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Spring Boot Starters
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-data-jpa")
+    implementation("org.springframework.boot:spring-boot-starter-security")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("org.springframework.boot:spring-boot-starter-actuator")
+    
+    // Database
+    runtimeOnly("org.postgresql:postgresql")
+    implementation("com.zaxxer:HikariCP")
+    
+    // Lombok
+    compileOnly("org.projectlombok:lombok")
+    annotationProcessor("org.projectlombok:lombok")
+    
+    // Testing
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.springframework.security:spring-security-test")
+    testImplementation("org.testcontainers:postgresql:1.19.3")
+}
+
+tasks.withType<Test> {
+    useJUnitPlatform()
+}
+```
+
+---
+
+### 2. Multi-Module Gradle Project
+
+**settings.gradle:**
+
+```gradle
+rootProject.name = 'order-system'
+
+include 'order-api'
+include 'order-service'
+include 'order-domain'
+include 'common-utils'
+```
+
+**Root build.gradle:**
+
+```gradle
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0' apply false
+    id 'io.spring.dependency-management' version '1.1.4' apply false
+}
+
+subprojects {
+    apply plugin: 'java'
+    apply plugin: 'io.spring.dependency-management'
+    
+    group = 'com.example.order'
+    version = '1.0.0'
+    sourceCompatibility = '17'
+    
+    repositories {
+        mavenCentral()
+    }
+    
+    dependencyManagement {
+        imports {
+            mavenBom("org.springframework.boot:spring-boot-dependencies:3.2.0")
+        }
+    }
+    
+    dependencies {
+        compileOnly 'org.projectlombok:lombok'
+        annotationProcessor 'org.projectlombok:lombok'
+        testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    }
+}
+```
+
+**Module-specific build.gradle (order-api):**
+
+```gradle
+plugins {
+    id 'org.springframework.boot'
+}
+
+dependencies {
+    implementation project(':order-service')
+    implementation project(':common-utils')
+    
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+}
+```
+
+---
+
+## Maven vs Gradle Comparison
+
+| Aspect | Maven | Gradle |
+|--------|-------|--------|
+| **Configuration** | XML (pom.xml) | Groovy/Kotlin DSL |
+| **Performance** | Slower incremental builds | Faster (build cache) |
+| **Flexibility** | Conventions-based | More flexible |
+| **Learning Curve** | Easier | Steeper |
+| **Multi-module** | Good support | Excellent support |
+| **Dependency Resolution** | Standard | Advanced (constraints) |
+| **Build Speed** | Moderate | Fast (incremental) |
+| **IDE Support** | Excellent | Excellent |
+| **Community** | Larger | Growing rapidly |
+
+**When to Use:**
+
+| Choose Maven | Choose Gradle |
+|--------------|---------------|
+| Team familiar with XML | Need faster builds |
+| Simple project structure | Complex multi-module projects |
+| Standard conventions sufficient | Need build customization |
+| Enterprise standards require Maven | Android development |
+| Less build configuration needed | Performance critical |
+
+---
+
+## Quick Reference: Build Commands
+
+### Maven Commands
+
+```bash
+# Build project
+mvn clean install
+
+# Run tests
+mvn test
+
+# Skip tests
+mvn clean install -DskipTests
+
+# Run application
+mvn spring-boot:run
+
+# Package as JAR
+mvn package
+
+# Generate sources
+mvn generate-sources
+
+# Dependency tree
+mvn dependency:tree
+
+# Update dependencies
+mvn versions:display-dependency-updates
+```
+
+### Gradle Commands
+
+```bash
+# Build project
+./gradlew build
+
+# Run tests
+./gradlew test
+
+# Skip tests
+./gradlew build -x test
+
+# Run application
+./gradlew bootRun
+
+# Package as JAR
+./gradlew bootJar
+
+# Clean build
+./gradlew clean build
+
+# Dependency tree
+./gradlew dependencies
+
+# Update dependencies
+./gradlew dependencyUpdates
+
+# Continuous build
+./gradlew build --continuous
+```
+
+---
+
+## Technology Stack Comparison Matrix
+
+### Reactive vs Traditional Stack
+
+| Component | Traditional (Servlet) | Reactive (WebFlux) |
+|-----------|---------------------|-------------------|
+| **Web Framework** | Spring MVC | Spring WebFlux |
+| **Server** | Tomcat (thread-per-request) | Netty (event loop) |
+| **Database Access** | JDBC, JPA (blocking) | R2DBC (non-blocking) |
+| **HTTP Client** | RestTemplate (blocking) | WebClient (non-blocking) |
+| **Security** | Spring Security (servlet) | Spring Security (reactive) |
+| **Scalability** | Thread pool limited | High concurrent connections |
+| **Use Case** | Traditional CRUD | Real-time, streaming |
+| **Learning Curve** | Lower | Higher |
+
+### REST vs GraphQL Decision Matrix
+
+| Criterion | Choose REST | Choose GraphQL |
+|-----------|-------------|----------------|
+| **API Consumers** | Known, limited | Multiple, diverse (mobile, web) |
+| **Data Requirements** | Standard CRUD | Complex, nested queries |
+| **Over/Under-fetching** | Acceptable | Must minimize |
+| **Caching** | Important | Less critical |
+| **Real-time** | Occasional | Frequent (subscriptions) |
+| **Team Expertise** | Low GraphQL knowledge | GraphQL experience |
+| **Versioning** | URL-based ok | Schema evolution preferred |
+
+### Cloud Provider Decision Matrix
+
+| Factor | AWS | GCP | Azure |
+|--------|-----|-----|-------|
+| **Market Share** | Largest | Growing | Second largest |
+| **Spring Integration** | Excellent | Good | Good |
+| **Compute Options** | ECS, Fargate, Lambda | GKE, Cloud Run | AKS, Container Instances |
+| **Database** | RDS, DynamoDB, Aurora | Cloud SQL, Firestore | Azure SQL, Cosmos DB |
+| **Messaging** | SQS, SNS, Kinesis | Pub/Sub | Service Bus, Event Hub |
+| **ML/AI** | SageMaker, Bedrock | Vertex AI | Azure ML |
+| **Pricing** | Competitive | Often cheaper | Enterprise-friendly |
+| **Best For** | Mature services, flexibility | Data/ML, Kubernetes | Microsoft ecosystem |
+
+---
+
+## Complete Technology Decision Guide
+
+### When to Use Each Pattern
+
+| Pattern/Technology | Use When | Avoid When |
+|-------------------|----------|-----------|
+| **Reactive Stack** | High concurrency, streaming data, real-time | Simple CRUD, team lacks experience |
+| **GraphQL** | Mobile apps, complex data fetching | Simple APIs, need HTTP caching |
+| **Microservices** | Large team, independent scaling | Small team, simple domain |
+| **Event-Driven** | Async workflows, loose coupling | Need immediate consistency |
+| **CQRS** | Different read/write workloads | Simple CRUD applications |
+| **Saga Pattern** | Distributed transactions | Single database transactions work |
+| **Circuit Breaker** | External dependencies | Internal, reliable services |
+| **Cache** | Read-heavy, expensive queries | Write-heavy, always fresh data |
+| **Async Processing** | Long-running operations | User needs immediate response |
